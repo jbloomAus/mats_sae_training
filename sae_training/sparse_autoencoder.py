@@ -38,6 +38,11 @@ class SparseAutoencoder(HookedRootModule):
         self.dtype = cfg.dtype
         self.device = cfg.device
 
+        # transcoder stuff
+        self.d_out = self.d_in
+        if cfg.is_transcoder and cfg.d_out is not None:
+            self.d_out = cfg.d_out
+
         # NOTE: if using resampling neurons method, you must ensure that we initialise the weights in the order W_enc, b_enc, W_dec, b_dec
         self.W_enc = nn.Parameter(
             torch.nn.init.kaiming_uniform_(
@@ -50,7 +55,7 @@ class SparseAutoencoder(HookedRootModule):
 
         self.W_dec = nn.Parameter(
             torch.nn.init.kaiming_uniform_(
-                torch.empty(self.d_sae, self.d_in, dtype=self.dtype, device=self.device)
+                torch.empty(self.d_sae, self.d_out, dtype=self.dtype, device=self.device)
             )
         )
 
@@ -62,6 +67,13 @@ class SparseAutoencoder(HookedRootModule):
             torch.zeros(self.d_in, dtype=self.dtype, device=self.device)
         )
 
+        self.b_dec_out = None
+        if cfg.is_transcoder:
+            self.b_dec_out = nn.Parameter(
+                torch.zeros(self.d_out, dtype=self.dtype, device=self.device)
+            )
+
+
         self.hook_sae_in = HookPoint()
         self.hook_hidden_pre = HookPoint()
         self.hook_hidden_post = HookPoint()
@@ -69,7 +81,7 @@ class SparseAutoencoder(HookedRootModule):
 
         self.setup()  # Required for `HookedRootModule`s
 
-    def forward(self, x, dead_neuron_mask=None):
+    def forward(self, x, dead_neuron_mask = None, mse_target=None):
         # move x to correct dtype
         x = x.to(self.dtype)
         sae_in = self.hook_sae_in(
@@ -86,21 +98,40 @@ class SparseAutoencoder(HookedRootModule):
         )
         feature_acts = self.hook_hidden_post(torch.nn.functional.relu(hidden_pre))
 
-        sae_out = self.hook_sae_out(
-            einops.einsum(
-                feature_acts,
-                self.W_dec,
-                "... d_sae, d_sae d_in -> ... d_in",
+        if self.cfg.is_transcoder:
+            # dumb if statement to deal with transcoders
+            # hopefully branch prediction takes care of this
+            sae_out = self.hook_sae_out(
+                einops.einsum(
+                    feature_acts,
+                    self.W_dec,
+                    "... d_sae, d_sae d_out -> ... d_out",
+                )
+                + self.b_dec_out
             )
-            + self.b_dec
-        )
+        else:
+            sae_out = self.hook_sae_out(
+                einops.einsum(
+                    feature_acts,
+                    self.W_dec,
+                    "... d_sae, d_sae d_out -> ... d_out",
+                )
+                + self.b_dec
+            )
 
         # add config for whether l2 is normalized:
-        x_centred = x - x.mean(dim=0, keepdim=True)
-        mse_loss = (
-            torch.pow((sae_out - x.float()), 2)
-            / (x_centred**2).sum(dim=-1, keepdim=True).sqrt()
-        )
+        if mse_target is None:
+            x_centred = x - x.mean(dim=0, keepdim=True)
+            mse_loss = (
+                torch.pow((sae_out - x.float()), 2)
+                / (x_centred**2).sum(dim=-1, keepdim=True).sqrt()
+            )
+        else:
+            target_centered = mse_target - mse_target.mean(dim=0, keepdim=True)
+            mse_loss = (
+                torch.pow((sae_out - mse_target.float()), 2)
+                / (target_centered**2).sum(dim=-1, keepdim=True).sqrt()
+            )
 
         mse_loss_ghost_resid = torch.tensor(0.0, dtype=self.dtype, device=self.device)
         # gate on config and training so evals is not slowed down.
@@ -153,10 +184,14 @@ class SparseAutoencoder(HookedRootModule):
 
     @torch.no_grad()
     def initialize_b_dec_with_geometric_median(self, activation_store):
+        assert(self.cfg.is_transcoder == activation_store.cfg.is_transcoder)
+
         previous_b_dec = self.b_dec.clone().cpu()
         all_activations = activation_store.storage_buffer.detach().cpu()
         out = compute_geometric_median(
-            all_activations, skip_typechecks=True, maxiter=100, per_component=False
+            all_activations,
+            skip_typechecks=True, 
+            maxiter=100, per_component=False
         ).median
 
         previous_distances = torch.norm(all_activations - previous_b_dec, dim=-1)
@@ -171,22 +206,57 @@ class SparseAutoencoder(HookedRootModule):
         out = torch.tensor(out, dtype=self.dtype, device=self.device)
         self.b_dec.data = out
 
+        if self.b_dec_out is not None:
+            # stupid code duplication
+            previous_b_dec_out = self.b_dec_out.clone().cpu()
+            all_activations_out = activation_store.storage_buffer_out.detach().cpu()
+            out_out = compute_geometric_median(
+                all_activations_out,
+                skip_typechecks=True, 
+                maxiter=100, per_component=False
+            ).median
+            
+            previous_distances_out = torch.norm(all_activations_out - previous_b_dec_out, dim=-1)
+            distances_out = torch.norm(all_activations_out - out_out, dim=-1)
+            
+            print("Reinitializing b_dec with geometric median of activations")
+            print(f"Previous distances: {previous_distances_out.median(0).values.mean().item()}")
+            print(f"New distances: {distances_out.median(0).values.mean().item()}")
+            
+            out_out = torch.tensor(out_out, dtype=self.dtype, device=self.device)
+            self.b_dec_out.data = out_out
+        
     @torch.no_grad()
     def initialize_b_dec_with_mean(self, activation_store):
+        assert(self.cfg.is_transcoder == activation_store.cfg.is_transcoder)
+
         previous_b_dec = self.b_dec.clone().cpu()
         all_activations = activation_store.storage_buffer.detach().cpu()
         out = all_activations.mean(dim=0)
 
         previous_distances = torch.norm(all_activations - previous_b_dec, dim=-1)
         distances = torch.norm(all_activations - out, dim=-1)
-
+        
         print("Reinitializing b_dec with mean of activations")
-        print(
-            f"Previous distances: {previous_distances.median(0).values.mean().item()}"
-        )
+        print(f"Previous distances: {previous_distances.median(0).values.mean().item()}")
         print(f"New distances: {distances.median(0).values.mean().item()}")
-
+        
         self.b_dec.data = out.to(self.dtype).to(self.device)
+
+        if self.b_dec_out is not None:
+            # stupid code duplication        
+            previous_b_dec_out = self.b_dec_out.clone().cpu()
+            all_activations_out = activation_store.storage_buffer_out.detach().cpu()
+            out_out = all_activations_out.mean(dim=0)
+            
+            previous_distances_out = torch.norm(all_activations_out - previous_b_dec_out, dim=-1)
+            distances_out = torch.norm(all_activations_out - out_out, dim=-1)
+            
+            print("Reinitializing b_dec with mean of activations")
+            print(f"Previous distances: {previous_distances_out.median(0).values.mean().item()}")
+            print(f"New distances: {distances_out.median(0).values.mean().item()}")
+            
+            self.b_dec_out.data = out_out.to(self.dtype).to(self.device)
 
     @torch.no_grad()
     def get_test_loss(self, batch_tokens, model):
@@ -233,13 +303,13 @@ class SparseAutoencoder(HookedRootModule):
         parallel_component = einops.einsum(
             self.W_dec.grad,
             self.W_dec.data,
-            "d_sae d_in, d_sae d_in -> d_sae",
+            "d_sae d_out, d_sae d_out -> d_sae",
         )
 
         self.W_dec.grad -= einops.einsum(
             parallel_component,
             self.W_dec.data,
-            "d_sae, d_sae d_in -> d_sae d_in",
+            "d_sae, d_sae d_out -> d_sae d_out",
         )
 
     def save_model(self, path: str):
